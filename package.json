@@ -1,0 +1,12 @@
+{
+  "name": "datscript",
+  "version": "0.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+  },
+  "author": "",
+  "license": "BSD",
+  "dependencies": {
+  }
+}

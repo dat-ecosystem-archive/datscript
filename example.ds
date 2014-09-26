@@ -1,0 +1,46 @@
+# validate cli args (TODO figure out details)
+args [url]
+
+# import another datscript file (i guess it imports all pipelines into this namespace too?)
+import foo.ds
+
+# set env var for all run commands to use
+env foo = "bar"
+
+# run a pipeline (hoists)
+run pipeline import
+
+# run a command (from node_modules/.bin or PATH)
+run foobar
+
+# run a command silently (pipe to /dev/null)
+run silent foobar
+
+# (best practice) define installation pipeline
+pipeline install
+  run docker pull maxogden/dat-r-transform
+  run npm install
+
+# define main (default) pipeline
+pipeline main
+  run pipeline import
+
+# define pipeline w/ piping
+pipeline import
+  run foobar | run dat import --json
+
+# define pipeline with sequential commands (runs commands one at a time and waits for exit before running next)
+pipeline import2
+  run foobar
+  run dat import --json
+
+# define pipeline with parallel spawning commands
+pipeline import3
+  run foobar &
+  run baz
+  
+# newlines matter, this won't work
+pipeline import run foobar run dat import --json
+
+# you can use semicolons if you want though
+pipeline import2; run foobar; run dat import --json;
