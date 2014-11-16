@@ -1,0 +1,142 @@
+# The following pseudocode tries to represent what a bioinformatics pipeline could
+# look like with bionode and datscripts. The default is that everything is a Stream
+# or a tool that supports pipes.
+#
+# Keywords:
+#
+# import - imports pipelines definitions from another datscript
+# run - runs a command and pipes the result
+# then - waits for the previous command to finish/exit before running the next one
+# pipe - like run, but reads data from stdin
+# fork - pipes stdout to other pipelines while also piping it to the next command downstream
+#
+# If theres a number after a command, that command will be "cloned" to provide
+# that number of concurrent "lanes", so that a slow operation due to a large input
+# does not prevent faster operations from smaller inputs to proceed.
+# Something like: https://github.com/bmpvieira/concurrent-stream
+# It would be nice if instead of a number we could specify "auto" and the
+# framework would figure out how many "lanes" could be spawned depending on the machine resources.
+
+import helper.ds as h                                             # Dat script that would contain the code not showed here
+
+
+project                                                           # Higher abstraction of the pipeline of this project
+  run fetch                                                       # Fetch metadata from NCBI that describes datasets
+  then run wrangle                                                # Reformat metadata. Since fetch does a lot of async network requests, we need to be sure everything finished before moving down.
+  pipe analysis                                                   # For each sample, download the raw data associated to the metadata and run analysis
+  pipe samplePlot                                                 # Plot the results for each sample
+  pipe updateOverallPlot                                          # Overall summary of the results for all samples
+  then h.email mail@bmpvieira.com                                 # When pipeline finishes, email author to know that there's nothing running anymore.
+
+
+
+# Fetch metadata from NCBI
+fetch
+  run reads
+
+reads                                                             # Get metadata of sequencing reads from NCBI
+  run bionode ncbi search sra Hymenoptera                         ## Query NCBI SRA database for Hymenoptera taxon
+  fork samples projects papers taxonomy                           ## Pipes objects to other pipelines
+  pipe dat reads                                                  ## Saves objects in dat reads repo
+
+
+samples                                                           # Get metadata of samples related to reads
+  pipe tool-stream extractProperty expxml.Biosample.id            ## Extracts Biosample ID
+  pipe tool-stream unique                                         ## Don't pipe repeated IDs
+  pipe 10 bionode ncbi search biosample                           ## Have 10 search "lanes" running concurrent queries to NCBI to get sample metadata
+  pipe dat samples                                                ## Store in dat samples repo
+samples                                                           # We can have pipeline names repeated, they just work as forks
+  pipe triplify sampleOfReads                                     ## Creates a triple to keep track of samples that relate to a particular reads
+  pipe levelgraph ncbi                                            ## Store in graph database
+
+
+projects                                                          # Get metadata of projects related to reads
+  pipe bionode ncbi link sra bioproject                           ## Query NCBI to get the Bioproject ID related to the SRA ID
+  pipe tool-stream extractProperty destUID                        ## Extract the Bioproject ID
+  pipe tool-stream unique                                         ## Don't pipe repeated IDs
+  pipe auto bionode ncbi search bioproject                        ## Have an autoscaling number of search "lanes" running concurrent queries to NCBI to get project metadata
+  pipe dat projects                                               ## Store in dat projects repo
+projects                                                          # We can have pipeline names repeated, they just work as forks
+  pipe triplify projectOfReads                                    ## Creates a triple to keep track of projects that relate to a particular reads
+  pipe levelgraph ncbi                                            ## Store in graph database
+
+
+papers                                                            # Get metadata of papers related to reads
+  pipe bionode ncbi link sra pubmed                               ## Query NCBI to get the pubmed ID related to the SRA ID
+  pipe tool-stream extractProperty destUID                        ## Extract the pubmed ID
+  pipe tool-stream unique                                         ## Don't pipe repeated IDs
+  pipe bionode ncbi search pubmed                                 ## Have one "lane" running queries to NCBI to get paper metadata
+  pipe dat papers                                                 ## Store in dat papers repo
+papers                                                            # We can have pipeline names repeated, they just work as forks
+  run triplify paperOfReads                                       ## Creates a triple to keep track of paper that relate to a particular reads
+  pipe levelgraph ncbi                                            ## Store in graph database
+
+
+taxonomy                                                          # Get metadata of taxonomy related to reads
+  pipe tool-stream extractProperty expxml.Organism.taxid          ## Extract the taxonomy ID
+  pipe tool-stream unique                                         ## Don't pipe repeated IDs
+  fork genomes                                                    ## Pipe objects to genome pipeline
+  pipe appendUIDString                                            ## Pipe to stream declared in datscript using a mix of datscript/javascript syntax
+  pipe 5 bionode ncbi search taxonomy                             ## Have 5 search "lanes" running concurrent queries to NCBI to get taxons metadata
+  pipe dat taxons                                                 ## Store in dat taxons repo
+taxonomy                                                          # We can have pipeline names repeated, they just work as forks
+  pipe triplify taxonOfReads                                      ## Creates a triple to keep track of taxon that relate to a particular reads
+  pipe levelgraph ncbi                                            ## Store in graph database
+
+
+genomes                                                           # Get metadata of genomes related to reads
+  pipe bionode ncbi link taxonomy genome                          ## Query NCBI to get the genome ID related to the SRA ID
+  pipe tool-stream extractProperty destUID                        ## Don't pipe repeated IDs
+  pipe tool-stream unique                                         ## Don't pipe repeated IDs
+  pipe bionode ncbi search genome                                 ## Have one "lane" running queries to NCBI to get genome metadata
+  pipe dat genomes                                                ## Store in dat genomes repo
+genomes                                                           # We can have pipeline names repeated, they just work as forks
+  pipe triplify genomeOfTaxon                                     ## Creates a triple to keep track of taxon that relate to a particular genome
+  pipe levelgraph ncbi                                            ## Store in graph database
+
+# Stream that adds the string '[uid]' to the end of the string being piped.
+# E.g., so that we have '100712[uid]' instead of '100712'
+# Because the taxonomy database on NCBI, unlike the others (sra, pubmed, etc),
+# can't search just with the number.
+# NCBI should fix that, or bionode-ncbi should handle this exception.
+# However, this provides an example of how small streams could be quickly written
+# in datscripts, by providing only the transform function for a through2 module stream
+stream appendUIDString(obj, next)
+  this.push(obj + '[uid]')
+  next()
+
+
+
+# Reformat metadata and remove what we can not use or are not interested in.
+wrangle
+  run dat cat samples                                             ## Start reading from the samples repo
+  pipe h.attachUIDsFromLevegraph                                  ## Using the sample ID, attach for all the other databases the related IDs
+  pipe h.attachReadsMetadata                                      ## Find in the reads repo the metadata and attach to the streamed sample object
+  pipe h.attachGenomesMetadata                                    ## Same as above, but for genomes
+  pipe h.attachProjectsMetadata                                   ## Same as above, but for projects
+  pipe h.attachPapersMetadata                                     ## Same as above, but for papers
+  pipe h.attachTaxonsMetadata                                     ## Same as above, but for taxons
+  pipe h.filterUnusableMetadata                                   ## Remove things we are not interested or can't use in the analysis
+  pipe h.summarize                                                ## Summarise the metadata for each sample by keeping only the fields we care about
+  pipe dat summary                                                ## Store in dat summary repo
+
+
+
+# Run the actual analysis, using the metadata summary to figure out what to do
+analysis
+  pipe 10 h.downloadReference                                     ## For each sample, download the reference genome (fasta) from NCBI. Do 10 concurrent downloads
+  pipe 5 h.downloadReads                                          ## For each sample, download the sequencing reads (sra) from NCBI. Do 5 concurrent downloads
+  pipe 5 h.extractReads                                           ## Extract the reads (sra->fastq). Do 5 concurrent.
+  pipe 5 h.alignReads                                             ## Align reads to reference genome (fasta+fastq->bam). Do 5 concurrent
+  pipe 20 h.callVariants                                          ## Find the variants in the alignment (bam->bcf). Since this is slow, do 20 concurrent
+  pipe 5 h.runAnalysis                                            ## Run the actual analysis/hypotesis we want to test using the variants information
+  pipe dat results                                                ## Store in dat results repo
+
+
+
+# Plot the results
+samplePlot                                                        # Plots the results for each sample. It would be nice if the dat editor had simple plots
+  pipe docker r-base sample_ggplot.R                              ## Used a docker container with R installed and a ggplot2 script
+
+overallPlot                                                       # Send sample summary statistics to a server to update overall plot
+  pipe docker ubuntu ./postData.rb                                ## Example using Docker and a Ruby script
